@@ -16,7 +16,7 @@
 
 **FlashInfer-for-SAIL** is a PPU-adapted kernel library and generator based on FlashInfer v0.6.8_post1. It provides runtime dependency, backend kernel, and build workflow adaptations for T-Head AI accelerator chips. It keeps FlashInfer's high-performance kernel generation capabilities and integrates PPU platform optimizations for running large language models and multimodal models on PPU devices.
 
-This document only covers the basic installation, verification, and usage workflow. For Attention Backend, JIT/AOT build tuning, known issues, and model-specific instructions, see the FlashInfer-for-SAIL User Guide.
+This document only covers the basic installation, verification, and usage workflow. For Attention Backend, JIT/AOT build tuning, known issues, and model-specific instructions, see the [FlashInfer-for-SAIL User Guide](https://www.flytiger-eco.com/docs_center/doc_detail/index.html?projectId=6&documentId=77).
 
 ## Why FlashInfer?
 

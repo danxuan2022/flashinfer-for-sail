@@ -54,11 +54,16 @@ permissions:
 env:
   IMAGE_NAME: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
   CUDA_ARCH_LIST: ${{ github.event.inputs.cuda_arch_list || '8.0' }}
+  # Per-compile-job memory budget used to derive MAX_JOBS. A standard hosted
+  # runner has 2 cores and ~7GB RAM, so 3GB/job lets both cores stay busy
+  # without inviting the OOM killer. Raise it if nvcc gets killed.
+  AOT_MAX_JOBS_MEMORY_GB: '3'
 
 jobs:
   build:
     name: PPU Build (wheel)
-    runs-on: ppu-linux-ubuntu24.04-py3.12
+    runs-on: ubuntu-latest
+    # 360 minutes is also GitHub's hard ceiling for hosted-runner jobs.
     timeout-minutes: 360
     steps:
       - name: Cleanup
@@ -120,6 +125,7 @@ jobs:
           bash ci/bash.sh "${IMAGE_NAME}" \
             -e TORCH_CUDA_ARCH_LIST "${CUDA_ARCH_LIST}" \
             -e FLASHINFER_CUDA_ARCH_LIST "${CUDA_ARCH_LIST}" \
+            -e AOT_MAX_JOBS_MEMORY_GB "${AOT_MAX_JOBS_MEMORY_GB}" \
             --no-gpu ./scripts/task_ppu_build_wheel.sh
 
       - name: Upload Wheel

@@ -12,6 +12,9 @@
 # Triggered on push / PR to v0.6.12 and manually via workflow_dispatch.
 # The code under test is the current checkout (not a fixed clone), so PRs
 # validate their own changes.
+#
+# The build image is pulled from GHCR, which is on the same network as the
+# runners. Mirror a new vendor image tag there with ppu-mirror-image.yml first.
 
 name: PPU Linux Build
 
@@ -50,9 +53,12 @@ concurrency:
 
 permissions:
   contents: read
+  packages: read
 
 env:
-  IMAGE_NAME: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+  # Mirrored from pkg.flytiger-eco.com by ppu-mirror-image.yml. Pulling the
+  # vendor registry directly on every build is too slow.
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/flashinfer-ppu-build:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
   CUDA_ARCH_LIST: ${{ github.event.inputs.cuda_arch_list || '8.0' }}
   # Per-compile-job memory budget used to derive MAX_JOBS. A standard hosted
   # runner has 2 cores and ~7GB RAM, so 3GB/job lets both cores stay busy
@@ -92,13 +98,21 @@ jobs:
             echo "Enough free space, skipping preinstalled SDK cleanup"
           fi
 
-      # Stage 1: pull the build image.
+      # Stage 1: pull the build image from GHCR.
       # ci/bash.sh pulls again right before `docker run`, but that is a cached
       # no-op. Pulling here keeps registry/network failures visible as their own
       # step instead of being buried in the build log.
+      #
+      # Logging in is not required while the package is public, but keeps this
+      # working if its visibility is ever flipped back to private.
       - name: Pull Image
         run: |
-          docker pull "${IMAGE_NAME}"
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "${IMAGE_NAME}" || {
+            echo "::error::Failed to pull ${IMAGE_NAME}. If the tag is missing, mirror it first by running the 'PPU Mirror Image' workflow."
+            exit 1
+          }
           docker images "${IMAGE_NAME}"
           df -h /
 

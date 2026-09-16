@@ -5,10 +5,22 @@
 set -eo pipefail
 set -x
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/jit_cache_build_common.sh
+source "${SCRIPT_DIR}/jit_cache_build_common.sh"
+
 : "${TORCH_CUDA_ARCH_LIST:=8.0}"
 : "${FLASHINFER_CUDA_ARCH_LIST:=8.0}"
 export TORCH_CUDA_ARCH_LIST
 export FLASHINFER_CUDA_ARCH_LIST
+
+# Derive MAX_JOBS / FLASHINFER_NVCC_THREADS from actual memory and CPU count.
+# Without MAX_JOBS, ninja defaults to nproc+2 concurrent nvcc processes, which
+# OOMs on small-memory builders. This build targets a single arch, so objects are
+# smaller than the multi-arch jit-cache builds the helper defaults to (8GB/job).
+: "${AOT_MAX_JOBS_MEMORY_GB:=4}"
+export AOT_MAX_JOBS_MEMORY_GB
+compute_jit_cache_parallelism
 
 echo "========================================"
 echo "Build environment"
@@ -20,6 +32,8 @@ python -c "import torch; print('torch:', torch.__version__, 'cuda:', torch.versi
 nvcc --version || echo "nvcc not found"
 echo "  - Available Memory: $(free -g | awk '/^Mem:/ {print $7}') GB"
 echo "  - Number of Processors: $(nproc)"
+echo "  - MAX_JOBS: ${MAX_JOBS} (budget ${MEM_PER_JOB} GB/job)"
+echo "  - NVCC_THREADS: ${FLASHINFER_NVCC_THREADS}"
 
 echo ""
 echo "========================================"

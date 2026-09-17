@@ -90,8 +90,12 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
           WAIT_TIMEOUT_MINUTES: '360'
           WAIT_INTERVAL_SECONDS: '60'
+        # NOTE: this runner has no bash on PATH, so GitHub falls back to sh
+        # (dash) for `run:` steps. Keep the script POSIX-compatible: no
+        # `set -o pipefail` (dash rejects it); every pipeline ends in `|| true`
+        # so failures are handled explicitly instead of via pipefail.
         run: |
-          set -euo pipefail
+          set -eu
           deadline=$(( $(date +%s) + WAIT_TIMEOUT_MINUTES * 60 ))
           echo "Waiting for a 'PPU Linux Build' run with head_sha=${HEAD_SHA} to complete..."
           while true; do
@@ -135,7 +139,7 @@ jobs:
         env:
           INPUT_RUN_ID: ${{ github.event.inputs.build_run_id }}
         run: |
-          set -euo pipefail
+          set -eu
           if ! [ "${INPUT_RUN_ID}" -gt 0 ] 2>/dev/null; then
             echo "::error::Invalid build_run_id: '${INPUT_RUN_ID}'"
             exit 1

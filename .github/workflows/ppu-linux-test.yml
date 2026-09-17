@@ -1,0 +1,195 @@
+# PPU test pipeline (PR-level, chained off "PPU Linux Build").
+#
+# This is the PPU counterpart of pr-test.yml, reduced to ONLY the
+# "GPU JIT Tests - H100 (Hopper) - Capacity Block" part, i.e. the unit-test
+# suite that scripts/task_run_unit_tests.sh runs on H100. Here it runs on a
+# ZhenWu 810E PPU (ppu001) instead of an H100.
+#
+# Dependency chain:
+#   - The wheel is NOT rebuilt here. It is produced by ppu-linux-build.yml and
+#     uploaded as the artifact "flashinfer-for-sail-wheel-<run_number>".
+#   - This workflow triggers via `workflow_run` when a "PPU Linux Build" run
+#     completes, downloads that run's wheel, installs it inside the PPU pod and
+#     runs the H100 unit-test suite against it. Because the build workflow is
+#     itself PR-triggered (push / pull_request to v0.6.12), this gives PR-level
+#     test coverage without a build/test race: workflow_run only fires after the
+#     build has finished.
+#
+# Execution model (flytiger-eco/ppu-distributed-action):
+#   - The job runs on a CPU-only orchestration runner (zero PPU occupancy).
+#   - actions/checkout puts the source in $GITHUB_WORKSPACE; the action tars it
+#     to NAS and unpacks it into source_dir (/workspace/source) inside the PPU
+#     worker pod before running `command`.
+#   - artifact_paths stages the downloaded wheel into the pod alongside source,
+#     so it lands at /workspace/source/wheelhouse/.
+#   - `command` then installs the wheel (NOT editable source) and runs pytest.
+
+name: PPU Linux Test
+
+on:
+  workflow_run:
+    workflows: ["PPU Linux Build"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'PPU Linux Build run ID to download the wheel from'
+        required: true
+        type: string
+
+# One build run maps to one test run; never cancel an in-flight PPU test.
+concurrency:
+  group: ppu-linux-test-${{ github.event.workflow_run.id || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # PPU worker pod image (SGLang-for-SAIL, ships the PPU torch runtime). Kept
+  # separate from the build image on purpose: tests validate the wheel against
+  # the runtime image users actually deploy.
+  PPU_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+  # Where the action unpacks the staged source inside the PPU pod.
+  PPU_SOURCE_DIR: /workspace/source
+
+jobs:
+  ppu-test-810e:
+    name: PPU Test (810E, H100 unit tests)
+    # Only test a build that actually succeeded. workflow_dispatch always runs.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 480
+    steps:
+      # Resolve which build run to pull the wheel from, and which commit the
+      # tests must match. For workflow_run we use the triggering build's head
+      # repo/sha so the source tree lines up with the compiled wheel.
+      - name: Resolve build run
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_RUN_ID: ${{ github.event.inputs.build_run_id }}
+          DISPATCH_REPO: ${{ github.repository }}
+          DISPATCH_REF: ${{ github.ref }}
+          WR_RUN_ID: ${{ github.event.workflow_run.id }}
+          WR_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          WR_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            RUN_ID="$INPUT_RUN_ID"
+            REPO="$DISPATCH_REPO"
+            REF="$DISPATCH_REF"
+          else
+            RUN_ID="$WR_RUN_ID"
+            REPO="$WR_REPO"
+            REF="$WR_SHA"
+          fi
+          # run_id must be numeric (it feeds an artifact-download API call).
+          if ! [ "$RUN_ID" -gt 0 ] 2>/dev/null; then
+            echo "::error::Invalid PPU Linux Build run id: '$RUN_ID'"
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "Build run: $RUN_ID | repo: $REPO | ref: $REF"
+
+      # The source tree the PPU pod will run tests from (staged by the action).
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.resolve.outputs.repo }}
+          ref: ${{ steps.resolve.outputs.ref }}
+          submodules: recursive
+
+      # actions/download-artifact@v4 can only read artifacts of the SAME run, so
+      # use dawidd6/action-download-artifact to pull the wheel from the build
+      # run. The artifact name embeds the build's run_number (unknown here), so
+      # match it with a regexp.
+      - name: Download wheel from build run
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          run_id: ${{ steps.resolve.outputs.run_id }}
+          name: flashinfer-for-sail-wheel-.*
+          name_is_regexp: true
+          path: wheelhouse
+          if_no_artifact_found: error
+
+      - name: Show downloaded wheel
+        run: |
+          echo "=== wheelhouse ==="
+          find wheelhouse -type f -print
+
+      # Submit the test job to a single 810E PPU (1 card) and run the H100
+      # unit-test suite against the downloaded wheel. nnodes: 0 => single node.
+      - name: Run H100 unit tests on 810E PPU
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=OAM-810E"
+          host_volumes: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
+          image: ${{ env.PPU_IMAGE }}
+          source_dir: ${{ env.PPU_SOURCE_DIR }}
+          artifact_paths: wheelhouse
+          namespace: ppu-sched
+          timeout_minutes: 420
+          command: |
+            set -euo pipefail
+            echo '=== PPU Verification ==='
+            echo "Hostname: $(hostname), Node: ${NODE_NAME:-}"
+            echo "RANK=${RANK:-} NODE_RANK=${NODE_RANK:-} WORLD_SIZE=${WORLD_SIZE:-} NPROC_PER_NODE=${NPROC_PER_NODE:-}"
+            ppu-smi || true
+            cd "${PPU_SOURCE_DIR:-/workspace/source}"
+            echo '--- source tree ---'
+            ls -al
+
+            # Locate the wheel staged from the build run and install it.
+            # --no-deps --force-reinstall: do NOT pull requirements.txt (it pins
+            # torch and would clobber the PPU runtime baked into this image);
+            # just install the compiled flashinfer-for-sail wheel over any
+            # preinstalled copy. This mirrors the README offline-install path.
+            WHEEL=$(ls -t wheelhouse/*/*.whl 2>/dev/null | head -n 1 || true)
+            if [ -z "$WHEEL" ]; then
+              echo "ERROR: no wheel found under wheelhouse/" >&2
+              find wheelhouse -type f -print || true
+              exit 1
+            fi
+            echo "Installing wheel: $WHEEL"
+            pip install --no-deps --force-reinstall "$WHEEL"
+
+            # Verify the install before spending PPU time on the suite.
+            python -c "import flashinfer; print('flashinfer', flashinfer.__version__)"
+            python -m flashinfer show-config || true
+
+            # The PPU image ships pytest via SGLang; install it only if missing
+            # (again without touching torch).
+            python -c "import pytest" 2>/dev/null || pip install --no-deps pytest
+
+            # H100 "Capacity Block" suite == scripts/task_run_unit_tests.sh's
+            # auto-discovered tests/ run. pytest.ini's norecursedirs applies
+            # automatically; single PPU => sequential execution.
+            echo '=== Run unit tests (H100 suite) ==='
+            pytest --continue-on-collection-errors tests/
+            echo '=== DONE ==='
+
+      - name: Test Summary
+        if: "!cancelled()"
+        run: |
+          {
+            echo "## PPU Linux Test"
+            echo "- Board: \`OAM-810E\` (1 PPU)"
+            echo "- Image: \`${PPU_IMAGE}\`"
+            echo "- Build run: \`${{ steps.resolve.outputs.run_id }}\`"
+            echo "- Ref: \`${{ steps.resolve.outputs.ref }}\`"
+            if [ "${{ job.status }}" = "success" ]; then
+              echo "- Status: Passed"
+            else
+              echo "- Status: ${{ job.status }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

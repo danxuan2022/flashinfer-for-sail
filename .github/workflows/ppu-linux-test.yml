@@ -1,19 +1,22 @@
-# PPU test pipeline (PR-level, chained off "PPU Linux Build").
+# PPU test pipeline (pull_request-triggered).
 #
 # This is the PPU counterpart of pr-test.yml, reduced to ONLY the
 # "GPU JIT Tests - H100 (Hopper) - Capacity Block" part, i.e. the unit-test
 # suite that scripts/task_run_unit_tests.sh runs on H100. Here it runs on a
 # ZhenWu 810E PPU (ppu001) instead of an H100.
 #
-# Dependency chain:
+# Dependency on the build (pull_request trigger => build and test start together):
 #   - The wheel is NOT rebuilt here. It is produced by ppu-linux-build.yml and
 #     uploaded as the artifact "flashinfer-for-sail-wheel-<run_number>".
-#   - This workflow triggers via `workflow_run` when a "PPU Linux Build" run
-#     completes, downloads that run's wheel, installs it inside the PPU pod and
-#     runs the H100 unit-test suite against it. Because the build workflow is
-#     itself PR-triggered (push / pull_request to v0.6.12), this gives PR-level
-#     test coverage without a build/test race: workflow_run only fires after the
-#     build has finished.
+#   - Both workflows trigger on the same pull_request to v0.6.12, so they run in
+#     parallel. To still consume the build's wheel, this job POLLS the Actions
+#     API for the sibling "PPU Linux Build" run sharing this PR's head SHA
+#     (github.sha == the PR merge commit, identical for both runs), waits for it
+#     to complete, then downloads its wheel by run id.
+#   - Trade-off vs workflow_run: the test job blocks for as long as the build
+#     takes (up to WAIT_TIMEOUT_MINUTES). Keep paths-ignore in sync with the
+#     build so docs-only PRs skip BOTH, otherwise we would wait on a build that
+#     never runs.
 #
 # Execution model (flytiger-eco/ppu-distributed-action):
 #   - The job runs on a CPU-only orchestration runner (zero PPU occupancy).
@@ -27,9 +30,18 @@
 name: PPU Linux Test
 
 on:
-  workflow_run:
-    workflows: ["PPU Linux Build"]
-    types: [completed]
+  pull_request:
+    branches: [v0.6.12]
+    types: [opened, synchronize, reopened, ready_for_review]
+    # Keep identical to ppu-linux-build.yml so a skipped build is never waited on.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'docker/**'
+      - 'licenses/**'
+      - 'benchmarks/**'
+      - 'LICENSE'
+      - 'NOTICE'
   workflow_dispatch:
     inputs:
       build_run_id:
@@ -37,10 +49,10 @@ on:
         required: true
         type: string
 
-# One build run maps to one test run; never cancel an in-flight PPU test.
+# A newer push to the same PR supersedes the stale run (and its build wait).
 concurrency:
-  group: ppu-linux-test-${{ github.event.workflow_run.id || github.run_id }}
-  cancel-in-progress: false
+  group: ppu-linux-test-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -57,53 +69,85 @@ env:
 jobs:
   ppu-test-810e:
     name: PPU Test (810E, H100 unit tests)
-    # Only test a build that actually succeeded. workflow_dispatch always runs.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 480
+    # Covers the build wait (up to WAIT_TIMEOUT_MINUTES) plus the PPU test run.
+    # Self-hosted runner, so exceeding the 6h hosted cap is allowed.
+    timeout-minutes: 720
     steps:
-      # Resolve which build run to pull the wheel from, and which commit the
-      # tests must match. For workflow_run we use the triggering build's head
-      # repo/sha so the source tree lines up with the compiled wheel.
-      - name: Resolve build run
-        id: resolve
+      # pull_request: build and test fire together, so WAIT for the sibling
+      # "PPU Linux Build" run on this PR's head SHA to finish, then use its id to
+      # download the wheel. Polls the Actions API with curl (present in the
+      # actions-runner image; jq/python/gh are not guaranteed there). head_sha is
+      # github.sha == the PR merge commit, identical for the build and test runs.
+      - name: Wait for PPU Linux Build (PR)
+        id: waitbuild
+        if: github.event_name == 'pull_request'
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_RUN_ID: ${{ github.event.inputs.build_run_id }}
-          DISPATCH_REPO: ${{ github.repository }}
-          DISPATCH_REF: ${{ github.ref }}
-          WR_RUN_ID: ${{ github.event.workflow_run.id }}
-          WR_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
-          WR_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUNS_API: https://api.github.com/repos/${{ github.repository }}/actions/workflows/ppu-linux-build.yml/runs
+          HEAD_SHA: ${{ github.sha }}
+          WAIT_TIMEOUT_MINUTES: '360'
+          WAIT_INTERVAL_SECONDS: '60'
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            RUN_ID="$INPUT_RUN_ID"
-            REPO="$DISPATCH_REPO"
-            REF="$DISPATCH_REF"
-          else
-            RUN_ID="$WR_RUN_ID"
-            REPO="$WR_REPO"
-            REF="$WR_SHA"
-          fi
-          # run_id must be numeric (it feeds an artifact-download API call).
-          if ! [ "$RUN_ID" -gt 0 ] 2>/dev/null; then
-            echo "::error::Invalid PPU Linux Build run id: '$RUN_ID'"
+          deadline=$(( $(date +%s) + WAIT_TIMEOUT_MINUTES * 60 ))
+          echo "Waiting for a 'PPU Linux Build' run with head_sha=${HEAD_SHA} to complete..."
+          while true; do
+            resp="$(curl -sfL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "${RUNS_API}?head_sha=${HEAD_SHA}&per_page=1" || true)"
+
+            run_id="$(printf '%s' "${resp}" | grep -o '"id":[[:space:]]*[0-9]\{1,\}' | head -1 | grep -o '[0-9]\{1,\}' || true)"
+            status="$(printf '%s' "${resp}" | grep -o '"status":[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/' || true)"
+            conclusion="$(printf '%s' "${resp}" | grep -o '"conclusion":[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/' || true)"
+
+            if [ -n "${run_id}" ] && [ "${status}" = "completed" ]; then
+              echo "Build run ${run_id} completed (conclusion=${conclusion:-none})."
+              if [ "${conclusion}" = "success" ]; then
+                echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::error::PPU Linux Build run ${run_id} did not succeed (conclusion=${conclusion:-none}); nothing to test."
+              exit 1
+            fi
+
+            if [ -n "${run_id}" ]; then
+              echo "Build run ${run_id} is '${status:-pending}'; retrying in ${WAIT_INTERVAL_SECONDS}s..."
+            else
+              echo "No 'PPU Linux Build' run for head_sha=${HEAD_SHA} yet; retrying in ${WAIT_INTERVAL_SECONDS}s..."
+            fi
+
+            if [ "$(date +%s)" -ge "${deadline}" ]; then
+              echo "::error::Timed out after ${WAIT_TIMEOUT_MINUTES}m waiting for PPU Linux Build (head_sha=${HEAD_SHA})."
+              exit 1
+            fi
+            sleep "${WAIT_INTERVAL_SECONDS}"
+          done
+
+      # workflow_dispatch: the run id is supplied directly, so no waiting needed.
+      - name: Resolve build run (dispatch)
+        id: dispatch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          INPUT_RUN_ID: ${{ github.event.inputs.build_run_id }}
+        run: |
+          set -euo pipefail
+          if ! [ "${INPUT_RUN_ID}" -gt 0 ] 2>/dev/null; then
+            echo "::error::Invalid build_run_id: '${INPUT_RUN_ID}'"
             exit 1
           fi
-          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
-          echo "ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "Build run: $RUN_ID | repo: $REPO | ref: $REF"
+          echo "run_id=${INPUT_RUN_ID}" >> "$GITHUB_OUTPUT"
 
       # The source tree the PPU pod will run tests from (staged by the action).
+      # For pull_request this checks out the PR merge commit (github.sha) - the
+      # exact tree the sibling build compiled the wheel from, so they match.
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.resolve.outputs.repo }}
-          ref: ${{ steps.resolve.outputs.ref }}
           submodules: recursive
 
       # actions/download-artifact@v4 can only read artifacts of the SAME run, so
@@ -114,7 +158,7 @@ jobs:
         uses: dawidd6/action-download-artifact@v6
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          run_id: ${{ steps.resolve.outputs.run_id }}
+          run_id: ${{ steps.waitbuild.outputs.run_id || steps.dispatch.outputs.run_id }}
           name: flashinfer-for-sail-wheel-.*
           name_is_regexp: true
           path: wheelhouse
@@ -138,7 +182,7 @@ jobs:
           source_dir: ${{ env.PPU_SOURCE_DIR }}
           artifact_paths: wheelhouse
           namespace: ppu-sched
-          timeout_minutes: 420
+          timeout_minutes: 300
           command: |
             set -euo pipefail
             echo '=== PPU Verification ==='
@@ -185,8 +229,8 @@ jobs:
             echo "## PPU Linux Test"
             echo "- Board: \`OAM-810E\` (1 PPU)"
             echo "- Image: \`${PPU_IMAGE}\`"
-            echo "- Build run: \`${{ steps.resolve.outputs.run_id }}\`"
-            echo "- Ref: \`${{ steps.resolve.outputs.ref }}\`"
+            echo "- Build run: \`${{ steps.waitbuild.outputs.run_id || steps.dispatch.outputs.run_id }}\`"
+            echo "- Commit: \`${{ github.sha }}\`"
             if [ "${{ job.status }}" = "success" ]; then
               echo "- Status: Passed"
             else

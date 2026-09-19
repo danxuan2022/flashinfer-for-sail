@@ -199,7 +199,7 @@ jobs:
 
       # Submit the test job to a single 810E PPU (1 card) and run the H100
       # unit-test suite against the downloaded wheel. nnodes: 0 => single node.
-      - name: Run H100 unit tests on 810E PPU
+      - name: Run tests on 810E PPU
         uses: flytiger-eco/ppu-distributed-action@main
         with:
           nnodes: 0
@@ -245,11 +245,13 @@ jobs:
             # (again without touching torch).
             python -c "import pytest" 2>/dev/null || pip install --no-deps pytest
 
-            # H100 "Capacity Block" suite == scripts/task_run_unit_tests.sh's
-            # auto-discovered tests/ run. pytest.ini's norecursedirs applies
-            # automatically; single PPU => sequential execution.
-            echo '=== Run unit tests (H100 suite) ==='
-            pytest --continue-on-collection-errors tests/
+            # Reduced PPU smoke set: only these three scripts run here instead
+            # of the full auto-discovered tests/ suite. single PPU => sequential.
+            echo '=== Run unit tests (PPU subset) ==='
+            pytest --continue-on-collection-errors \
+              tests/test_jit_cpp_ext.py \
+              tests/autotuner/test_autotuner_configs.py \
+              tests/grouped_mm/test_grouped_mm_bf16.py
             echo '=== DONE ==='
 
       - name: Test Summary

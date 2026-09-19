@@ -43,12 +43,12 @@ jobs:
   #   secrets: inherit
 
   # Stage 4: 完整业务 CI
-  ci:
-    name: Full CI
-    needs: human-review
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run full CI
-        run: |
-          echo "在此替换为你的完整 CI 命令（构建 / 单测 / 打包等）"
+  # ci:
+  #   name: Full CI
+  #   needs: human-review
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Run full CI
+  #       run: |
+  #         echo "在此替换为你的完整 CI 命令（构建 / 单测 / 打包等）"

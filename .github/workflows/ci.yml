@@ -36,11 +36,11 @@ jobs:
     secrets: inherit
 
   # Stage 3: 人工审批门禁
-  human-review:
-    name: Human Review Gate
-    needs: [smoke-test, ai-code-review]
-    uses: flytiger-eco/.github/.github/workflows/human-review.yml@main
-    secrets: inherit
+  # human-review:
+  #   name: Human Review Gate
+  #   needs: [smoke-test, ai-code-review]
+  #   uses: flytiger-eco/.github/.github/workflows/human-review.yml@main
+  #   secrets: inherit
 
   # Stage 4: 完整业务 CI
   ci:

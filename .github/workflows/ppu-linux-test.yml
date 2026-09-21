@@ -33,7 +33,7 @@ env:
 
 jobs:
   ppu-test-810e:
-    name: PPU Test (810E, H100 unit tests)
+    name: PPU Test (810E tests)
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest

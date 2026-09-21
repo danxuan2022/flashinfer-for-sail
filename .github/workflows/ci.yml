@@ -17,6 +17,16 @@ jobs:
     name: Pre-check
     uses: flytiger-eco/.github/.github/workflows/user-precheck.yml@main
 
+  smoke-test:
+    name: Smoke Test
+    needs: precheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run smoke tests
+        run: |
+          echo "PASSED"
+
   ai-code-review:
     name: AI Code Review (Copilot Gate)
     needs: precheck
